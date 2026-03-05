@@ -3,6 +3,7 @@ import {
   applyDefaultEffort,
   approxTokenCount,
   hasEffortFlag,
+  parseChatgptRefreshConfigFromAuthJson,
   parseChatgptTokenFromAuthJson,
   parseClaudexArgs,
   parseApiKeyFromAuthJson,
@@ -95,7 +96,7 @@ describe("parseApiKeyFromAuthJson", () => {
 });
 
 describe("parseChatgptTokenFromAuthJson", () => {
-  test("prefers tokens.id_token and reads account_id", () => {
+  test("prefers tokens.access_token and reads account_id", () => {
     const authJson = JSON.stringify({
       tokens: {
         id_token: "id-token-value",
@@ -104,20 +105,20 @@ describe("parseChatgptTokenFromAuthJson", () => {
       },
     });
     const parsed = parseChatgptTokenFromAuthJson(authJson);
-    expect(parsed.bearerToken).toBe("id-token-value");
+    expect(parsed.bearerToken).toBe("access-token-value");
     expect(parsed.accountId).toBe("acct_123");
-    expect(parsed.source).toBe("tokens.id_token");
+    expect(parsed.source).toBe("tokens.access_token");
   });
 
-  test("falls back to tokens.access_token", () => {
+  test("falls back to tokens.id_token", () => {
     const authJson = JSON.stringify({
       tokens: {
-        access_token: "access-token-value",
+        id_token: "id-token-value",
       },
     });
     const parsed = parseChatgptTokenFromAuthJson(authJson);
-    expect(parsed.bearerToken).toBe("access-token-value");
-    expect(parsed.source).toBe("tokens.access_token");
+    expect(parsed.bearerToken).toBe("id-token-value");
+    expect(parsed.source).toBe("tokens.id_token");
   });
 
   test("env bearer token wins", () => {
@@ -138,6 +139,22 @@ describe("parseChatgptTokenFromAuthJson", () => {
   test("throws without token fields", () => {
     const authJson = JSON.stringify({ OPENAI_API_KEY: "sk-test" });
     expect(() => parseChatgptTokenFromAuthJson(authJson)).toThrow("failed to read ChatGPT token");
+  });
+});
+
+describe("parseChatgptRefreshConfigFromAuthJson", () => {
+  test("reads refresh token and client id from id_token aud", () => {
+    const payload = Buffer.from(JSON.stringify({ aud: ["app_test_client_id"] })).toString("base64url");
+    const idToken = `x.${payload}.y`;
+    const authJson = JSON.stringify({
+      tokens: {
+        id_token: idToken,
+        refresh_token: "refresh-token-value",
+      },
+    });
+    const parsed = parseChatgptRefreshConfigFromAuthJson(authJson);
+    expect(parsed.refreshToken).toBe("refresh-token-value");
+    expect(parsed.clientId).toBe("app_test_client_id");
   });
 });
 

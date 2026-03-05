@@ -207,10 +207,10 @@ export function parseChatgptTokenFromAuthJson(
     value: unknown;
     source: ParsedChatgptTokenFromAuth["source"];
   }> = [
-    { value: parsed?.tokens?.id_token, source: "tokens.id_token" },
     { value: parsed?.tokens?.access_token, source: "tokens.access_token" },
-    { value: parsed?.id_token, source: "id_token" },
+    { value: parsed?.tokens?.id_token, source: "tokens.id_token" },
     { value: parsed?.access_token, source: "access_token" },
+    { value: parsed?.id_token, source: "id_token" },
   ];
 
   for (const candidate of orderedCandidates) {
@@ -226,6 +226,52 @@ export function parseChatgptTokenFromAuthJson(
   throw new Error(
     "failed to read ChatGPT token from ~/.codex/auth.json (expected tokens.id_token or tokens.access_token)"
   );
+}
+
+function decodeJwtPayload(token?: string): any | null {
+  if (typeof token !== "string") {
+    return null;
+  }
+  const parts = token.split(".");
+  if (parts.length < 2) {
+    return null;
+  }
+
+  try {
+    const normalized = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    return JSON.parse(Buffer.from(normalized, "base64").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+export interface ParsedChatgptRefreshConfigFromAuth {
+  refreshToken?: string;
+  clientId?: string;
+}
+
+export function parseChatgptRefreshConfigFromAuthJson(contents: string): ParsedChatgptRefreshConfigFromAuth {
+  const parsed = parseAuthJson(contents);
+
+  const refreshToken = firstNonEmptyString([parsed?.tokens?.refresh_token, parsed?.refresh_token]);
+  let clientId = firstNonEmptyString([
+    parsed?.tokens?.client_id,
+    parsed?.client_id,
+    parsed?.oauth?.client_id,
+  ]);
+
+  if (!clientId) {
+    const idToken = firstNonEmptyString([parsed?.tokens?.id_token, parsed?.id_token]);
+    const payload = decodeJwtPayload(idToken);
+    const aud = payload?.aud;
+    if (typeof aud === "string" && aud.trim().length > 0) {
+      clientId = aud.trim();
+    } else if (Array.isArray(aud) && typeof aud[0] === "string" && aud[0].trim().length > 0) {
+      clientId = aud[0].trim();
+    }
+  }
+
+  return { refreshToken, clientId };
 }
 
 export function approxTokenCount(body: JsonObject): number {

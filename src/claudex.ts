@@ -4,13 +4,14 @@ import http from "node:http";
 import net from "node:net";
 import { Readable } from "node:stream";
 import { spawn } from "node:child_process";
-import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import {
   applyDefaultEffort,
   approxTokenCount,
   hasEffortFlag,
+  parseChatgptRefreshConfigFromAuthJson,
   parseChatgptTokenFromAuthJson,
   parseClaudexArgs,
   parseApiKeyFromAuthJson,
@@ -50,6 +51,11 @@ interface RuntimeConfig {
   upstreamExtraHeaders: Record<string, string>;
   forcedModel: string;
   authMode: "provider-api-key" | "chatgpt-token" | "chatgpt-api-key";
+  chatgptRefreshConfig?: {
+    authPath: string;
+    refreshToken: string;
+    clientId: string;
+  };
 }
 
 interface ProxyOptions {
@@ -57,6 +63,17 @@ interface ProxyOptions {
   defaultReasoningEffort: string;
   preserveClientEffort: boolean;
   debug: boolean;
+}
+
+interface UpstreamAuthState {
+  bearerToken: string;
+  extraHeaders: Record<string, string>;
+  chatgptRefreshConfig?: {
+    authPath: string;
+    refreshToken: string;
+    clientId: string;
+  };
+  refreshInFlight?: Promise<string>;
 }
 
 function fail(message: string): never {
@@ -164,11 +181,19 @@ function loadRuntimeConfig(): RuntimeConfig {
       envBearerToken,
       envAccountId: envChatgptAccountId,
     });
+    const refreshConfig = authContents.trim().length > 0 ? parseChatgptRefreshConfigFromAuthJson(authContents) : {};
 
     const extraHeaders: Record<string, string> = {};
     if (tokenAuth.accountId) {
       extraHeaders["chatgpt-account-id"] = tokenAuth.accountId;
     }
+
+    const canAutoRefresh =
+      !envBearerToken?.trim() &&
+      typeof refreshConfig.refreshToken === "string" &&
+      refreshConfig.refreshToken.length > 0 &&
+      typeof refreshConfig.clientId === "string" &&
+      refreshConfig.clientId.length > 0;
 
     return {
       upstreamBaseUrl: chatgptBaseUrl,
@@ -176,6 +201,13 @@ function loadRuntimeConfig(): RuntimeConfig {
       upstreamExtraHeaders: extraHeaders,
       forcedModel,
       authMode: "chatgpt-token",
+      chatgptRefreshConfig: canAutoRefresh
+        ? {
+            authPath,
+            refreshToken: refreshConfig.refreshToken!,
+            clientId: refreshConfig.clientId!,
+          }
+        : undefined,
     };
   } catch {
     const upstreamBearerToken = parseApiKeyFromAuthJson(authContents, envApiKey);
@@ -294,18 +326,141 @@ function buildUpstreamUrl(upstreamOrigin: URL, requestPath: string): URL {
   return upstream;
 }
 
+function persistRefreshedChatgptTokens(
+  authPath: string,
+  refreshed: {
+    accessToken: string;
+    idToken?: string;
+    refreshToken?: string;
+  },
+  options: {
+    debug: boolean;
+  }
+): void {
+  try {
+    const current = existsSync(authPath) ? readFileSync(authPath, "utf8") : "{}";
+    const parsed = JSON.parse(current) as Record<string, any>;
+    if (!parsed.tokens || typeof parsed.tokens !== "object") {
+      parsed.tokens = {};
+    }
+
+    parsed.tokens.access_token = refreshed.accessToken;
+    if (typeof refreshed.idToken === "string" && refreshed.idToken.length > 0) {
+      parsed.tokens.id_token = refreshed.idToken;
+    }
+    if (typeof refreshed.refreshToken === "string" && refreshed.refreshToken.length > 0) {
+      parsed.tokens.refresh_token = refreshed.refreshToken;
+    }
+    parsed.last_refresh = new Date().toISOString();
+
+    writeFileSync(authPath, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
+  } catch (error) {
+    if (options.debug) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`claudex: warning: failed to persist refreshed auth tokens: ${message}`);
+    }
+  }
+}
+
+async function refreshChatgptBearerToken(
+  authState: UpstreamAuthState,
+  options: {
+    debug: boolean;
+  }
+): Promise<string> {
+  if (!authState.chatgptRefreshConfig) {
+    throw new Error("chatgpt refresh config is missing");
+  }
+  if (authState.refreshInFlight) {
+    return authState.refreshInFlight;
+  }
+
+  authState.refreshInFlight = (async () => {
+    const refreshConfig = authState.chatgptRefreshConfig!;
+    const response = await fetch("https://auth.openai.com/oauth/token", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        refresh_token: refreshConfig.refreshToken,
+        client_id: refreshConfig.clientId,
+      }),
+    });
+
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(`token refresh failed with status ${response.status}: ${text.slice(0, 200)}`);
+    }
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error("token refresh returned non-JSON response");
+    }
+
+    const refreshedAccessToken =
+      typeof parsed.access_token === "string" && parsed.access_token.trim().length > 0
+        ? parsed.access_token.trim()
+        : undefined;
+    const refreshedIdToken =
+      typeof parsed.id_token === "string" && parsed.id_token.trim().length > 0
+        ? parsed.id_token.trim()
+        : undefined;
+    const refreshedRefreshToken =
+      typeof parsed.refresh_token === "string" && parsed.refresh_token.trim().length > 0
+        ? parsed.refresh_token.trim()
+        : undefined;
+
+    const nextBearerToken = refreshedAccessToken || refreshedIdToken;
+    if (!nextBearerToken) {
+      throw new Error("token refresh response did not include access_token or id_token");
+    }
+
+    authState.bearerToken = nextBearerToken;
+    if (refreshedRefreshToken) {
+      authState.chatgptRefreshConfig = {
+        ...authState.chatgptRefreshConfig!,
+        refreshToken: refreshedRefreshToken,
+      };
+    }
+
+    persistRefreshedChatgptTokens(
+      refreshConfig.authPath,
+      {
+        accessToken: refreshedAccessToken || authState.bearerToken,
+        idToken: refreshedIdToken,
+        refreshToken: refreshedRefreshToken,
+      },
+      options
+    );
+
+    if (options.debug) {
+      console.error("claudex: refreshed ChatGPT bearer token using refresh_token");
+    }
+    return authState.bearerToken;
+  })().finally(() => {
+    authState.refreshInFlight = undefined;
+  });
+
+  return authState.refreshInFlight;
+}
+
 async function proxyRaw(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   bodyBuffer: Buffer,
   requestPath: string,
   upstreamOrigin: URL,
-  upstreamBearerToken: string,
-  upstreamExtraHeaders: Record<string, string>,
-  overrideBody: JsonObject | null = null
+  authState: UpstreamAuthState,
+  debugLogging: boolean,
+  overrideBody: JsonObject | null = null,
+  allowRefreshRetry = true
 ): Promise<void> {
   const headers: Record<string, string> = {
-    authorization: `Bearer ${upstreamBearerToken}`,
+    authorization: `Bearer ${authState.bearerToken}`,
   };
 
   for (const [key, value] of Object.entries(req.headers)) {
@@ -318,7 +473,7 @@ async function proxyRaw(
     }
     headers[normalized] = Array.isArray(value) ? value.join(", ") : value;
   }
-  for (const [key, value] of Object.entries(upstreamExtraHeaders)) {
+  for (const [key, value] of Object.entries(authState.extraHeaders)) {
     headers[key.toLowerCase()] = value;
   }
 
@@ -339,6 +494,19 @@ async function proxyRaw(
     body: req.method === "GET" || req.method === "HEAD" ? undefined : outboundBody,
   });
 
+  if (upstreamResponse.status === 401 && allowRefreshRetry && authState.chatgptRefreshConfig) {
+    try {
+      await refreshChatgptBearerToken(authState, { debug: debugLogging });
+      await proxyRaw(req, res, bodyBuffer, requestPath, upstreamOrigin, authState, debugLogging, overrideBody, false);
+      return;
+    } catch (error) {
+      if (debugLogging) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`claudex: token refresh attempt failed: ${message}`);
+      }
+    }
+  }
+
   res.writeHead(upstreamResponse.status, copyHeadersFromUpstream(upstreamResponse.headers));
   if (!upstreamResponse.body) {
     res.end();
@@ -354,8 +522,15 @@ async function startProxy(
   upstreamOrigin: URL,
   upstreamBearerToken: string,
   upstreamExtraHeaders: Record<string, string>,
+  chatgptRefreshConfig: RuntimeConfig["chatgptRefreshConfig"],
   options: ProxyOptions
 ): Promise<http.Server> {
+  const authState: UpstreamAuthState = {
+    bearerToken: upstreamBearerToken,
+    extraHeaders: upstreamExtraHeaders,
+    chatgptRefreshConfig,
+  };
+
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url || "/", `http://${listenHost}:${listenPort}`);
@@ -447,8 +622,8 @@ async function startProxy(
           bodyBuffer,
           url.pathname + url.search,
           upstreamOrigin,
-          upstreamBearerToken,
-          upstreamExtraHeaders,
+          authState,
+          options.debug,
           parsed
         );
         return;
@@ -461,8 +636,8 @@ async function startProxy(
         bodyBuffer,
         url.pathname + url.search,
         upstreamOrigin,
-        upstreamBearerToken,
-        upstreamExtraHeaders
+        authState,
+        options.debug
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -501,6 +676,7 @@ async function main(): Promise<void> {
     upstreamOrigin,
     runtime.upstreamBearerToken,
     runtime.upstreamExtraHeaders,
+    runtime.chatgptRefreshConfig,
     {
       forcedModel: runtime.forcedModel,
       defaultReasoningEffort,
@@ -510,8 +686,9 @@ async function main(): Promise<void> {
   );
 
   const proxyUrl = `http://${listenHost}:${listenPort}`;
+  const refreshStatus = runtime.chatgptRefreshConfig ? "on" : "off";
   console.error(
-    `claudex: proxy=${proxyUrl} force_model=${runtime.forcedModel} safe_mode=${safeMode} auth_mode=${runtime.authMode}`
+    `claudex: proxy=${proxyUrl} force_model=${runtime.forcedModel} safe_mode=${safeMode} auth_mode=${runtime.authMode} auto_refresh=${refreshStatus}`
   );
 
   const injectedArgs = [...args];
