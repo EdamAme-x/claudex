@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   auto-release:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,7 +31,7 @@ jobs:
 
           installer_url="https://claude.ai/install.sh"
           installer_script="$(curl -fsSL "${installer_url}")"
-          bucket="$(printf '%s\n' "${installer_script}" | sed -n 's/^GCS_BUCKET="\([^"]\+\)".*/\1/p' | head -n1)"
+          bucket="$(printf '%s\n' "${installer_script}" | awk -F'"' '/^GCS_BUCKET=/{print $2; exit}')"
           if [[ -z "${bucket}" ]]; then
             echo "Failed to extract GCS_BUCKET from installer script: ${installer_url}"
             exit 1
@@ -83,8 +83,10 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Build release binaries
+      - name: Build release binaries and macOS packages
         if: steps.detect.outputs.should_release == 'true'
+        env:
+          CLAUDEX_PKG_VERSION: ${{ steps.detect.outputs.latest_version }}
         run: |
           set -euo pipefail
           bun run build:release
@@ -104,4 +106,6 @@ jobs:
             dist/claudex-linux-arm64
             dist/claudex-macos-x64
             dist/claudex-macos-arm64
+            dist/claudex-macos-x64.pkg
+            dist/claudex-macos-arm64.pkg
             dist/claudex-windows-x64.exe
