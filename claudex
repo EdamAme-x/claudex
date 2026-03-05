@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+OPENAI_MD="$SCRIPT_DIR/OPENAI.md"
+PROXY_SCRIPT="$SCRIPT_DIR/claudex-proxy.mjs"
+
+if [[ ! -f "$OPENAI_MD" ]]; then
+  echo "claudex: missing file: $OPENAI_MD" >&2
+  exit 1
+fi
+
+if [[ ! -f "$PROXY_SCRIPT" ]]; then
+  echo "claudex: missing file: $PROXY_SCRIPT" >&2
+  exit 1
+fi
+
+UPSTREAM_BASE_URL="$(sed -n 's/^[[:space:]]*base_url[[:space:]]*=[[:space:]]*"\([^"]\+\)".*/\1/p' "$OPENAI_MD" | head -n1)"
+UPSTREAM_API_KEY="$(sed -n 's/.*"OPENAI_API_KEY"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*/\1/p' "$OPENAI_MD" | head -n1)"
+
+if [[ -z "${UPSTREAM_BASE_URL:-}" ]]; then
+  echo "claudex: failed to read base_url from OPENAI.md" >&2
+  exit 1
+fi
+
+if [[ -z "${UPSTREAM_API_KEY:-}" ]]; then
+  echo "claudex: failed to read OPENAI_API_KEY from OPENAI.md" >&2
+  exit 1
+fi
+
+CLAUDEX_FORCE_MODEL="${CLAUDEX_FORCE_MODEL:-gpt-5.3-codex}"
+CLAUDEX_PRESERVE_CLIENT_EFFORT=0
+for arg in "$@"; do
+  if [[ "$arg" == "--effort" ]] || [[ "$arg" == --effort=* ]]; then
+    CLAUDEX_PRESERVE_CLIENT_EFFORT=1
+    break
+  fi
+done
+
+if [[ -n "${CLAUDEX_CLAUDE_BIN:-}" ]]; then
+  CLAUDE_BIN="$CLAUDEX_CLAUDE_BIN"
+elif [[ -x "$SCRIPT_DIR/reverse/claude-2.1.69-linux-x64" ]]; then
+  CLAUDE_BIN="$SCRIPT_DIR/reverse/claude-2.1.69-linux-x64"
+elif command -v claude >/dev/null 2>&1; then
+  CLAUDE_BIN="$(command -v claude)"
+else
+  echo "claudex: Claude binary not found. Set CLAUDEX_CLAUDE_BIN." >&2
+  exit 1
+fi
+
+pick_free_port() {
+  node -e 'const net=require("node:net");const s=net.createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close();});'
+}
+
+CLAUDEX_PORT="${CLAUDEX_PORT:-$(pick_free_port)}"
+PROXY_LOG="${CLAUDEX_PROXY_LOG:-/tmp/claudex-proxy-${CLAUDEX_PORT}.log}"
+
+cleanup() {
+  if [[ -n "${PROXY_PID:-}" ]]; then
+    kill "${PROXY_PID}" >/dev/null 2>&1 || true
+    wait "${PROXY_PID}" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+CLAUDEX_LISTEN_HOST="127.0.0.1" \
+CLAUDEX_LISTEN_PORT="$CLAUDEX_PORT" \
+CLAUDEX_UPSTREAM_BASE_URL="$UPSTREAM_BASE_URL" \
+CLAUDEX_UPSTREAM_API_KEY="$UPSTREAM_API_KEY" \
+CLAUDEX_FORCE_MODEL="$CLAUDEX_FORCE_MODEL" \
+CLAUDEX_PRESERVE_CLIENT_EFFORT="$CLAUDEX_PRESERVE_CLIENT_EFFORT" \
+node "$PROXY_SCRIPT" >"$PROXY_LOG" 2>&1 &
+PROXY_PID=$!
+
+ready=false
+for _ in $(seq 1 80); do
+  if curl -fsS "http://127.0.0.1:${CLAUDEX_PORT}/health" >/dev/null 2>&1; then
+    ready=true
+    break
+  fi
+  sleep 0.05
+done
+
+if [[ "$ready" != "true" ]]; then
+  echo "claudex: failed to start proxy. log: $PROXY_LOG" >&2
+  sed -n '1,120p' "$PROXY_LOG" >&2 || true
+  exit 1
+fi
+
+echo "claudex: proxy=http://127.0.0.1:${CLAUDEX_PORT} force_model=${CLAUDEX_FORCE_MODEL}" >&2
+
+ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDEX_PORT}" \
+ANTHROPIC_API_KEY="claudex-local" \
+ANTHROPIC_MODEL="${CLAUDEX_FORCE_MODEL}" \
+ANTHROPIC_SMALL_FAST_MODEL="${CLAUDEX_FORCE_MODEL}" \
+ANTHROPIC_DEFAULT_OPUS_MODEL="${CLAUDEX_FORCE_MODEL}" \
+ANTHROPIC_DEFAULT_SONNET_MODEL="${CLAUDEX_FORCE_MODEL}" \
+ANTHROPIC_DEFAULT_HAIKU_MODEL="${CLAUDEX_FORCE_MODEL}" \
+CLAUDE_CODE_SUBAGENT_MODEL="${CLAUDEX_FORCE_MODEL}" \
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+"$CLAUDE_BIN" "$@"
