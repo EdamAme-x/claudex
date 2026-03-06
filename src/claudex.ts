@@ -351,6 +351,385 @@ function buildUpstreamUrl(upstreamOrigin: URL, requestPath: string): URL {
   return upstream;
 }
 
+function rewriteRequestPathForChatgptCodex(upstreamOrigin: URL, requestPath: string): string {
+  const incoming = new URL(requestPath, "http://localhost");
+  const basePath = normalizeBasePath(upstreamOrigin.pathname);
+  const isChatgptCodex =
+    upstreamOrigin.hostname === "chatgpt.com" && basePath.startsWith("/backend-api/codex");
+
+  if (isChatgptCodex && incoming.pathname === "/v1/messages") {
+    incoming.pathname = "/responses";
+  }
+
+  return `${incoming.pathname}${incoming.search}`;
+}
+
+function isChatgptCodexEndpoint(upstreamOrigin: URL): boolean {
+  const basePath = normalizeBasePath(upstreamOrigin.pathname);
+  return upstreamOrigin.hostname === "chatgpt.com" && basePath.startsWith("/backend-api/codex");
+}
+
+function extractInstructionsFromSystem(systemField: unknown): string | undefined {
+  if (typeof systemField === "string" && systemField.trim().length > 0) {
+    return systemField.trim();
+  }
+  if (!Array.isArray(systemField)) {
+    return undefined;
+  }
+
+  const parts: string[] = [];
+  for (const item of systemField) {
+    if (typeof item === "string" && item.trim().length > 0) {
+      parts.push(item.trim());
+      continue;
+    }
+    if (item && typeof item === "object") {
+      const text = (item as Record<string, unknown>).text;
+      if (typeof text === "string" && text.trim().length > 0) {
+        parts.push(text.trim());
+      }
+    }
+  }
+
+  if (parts.length === 0) {
+    return undefined;
+  }
+  return parts.join("\n\n");
+}
+
+function toResponsesInput(messages: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(messages)) {
+    return [];
+  }
+
+  const mapped: Array<Record<string, unknown>> = [];
+  for (const message of messages) {
+    if (!message || typeof message !== "object") {
+      continue;
+    }
+    const roleRaw = (message as Record<string, unknown>).role;
+    const role = typeof roleRaw === "string" ? roleRaw : "user";
+    const contentRaw = (message as Record<string, unknown>).content;
+
+    const parts: Array<Record<string, unknown>> = [];
+    if (typeof contentRaw === "string") {
+      parts.push({
+        type: role === "assistant" ? "output_text" : "input_text",
+        text: contentRaw,
+      });
+    } else if (Array.isArray(contentRaw)) {
+      for (const part of contentRaw) {
+        if (typeof part === "string") {
+          parts.push({
+            type: role === "assistant" ? "output_text" : "input_text",
+            text: part,
+          });
+          continue;
+        }
+        if (!part || typeof part !== "object") {
+          continue;
+        }
+        const text = (part as Record<string, unknown>).text;
+        if (typeof text === "string" && text.length > 0) {
+          parts.push({
+            type: role === "assistant" ? "output_text" : "input_text",
+            text,
+          });
+        }
+      }
+    }
+
+    if (parts.length === 0) {
+      continue;
+    }
+    mapped.push({
+      role,
+      content: parts,
+    });
+  }
+  return mapped;
+}
+
+function writeSseEvent(res: http.ServerResponse, event: string, data: unknown): void {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function buildForwardHeaders(
+  req: http.IncomingMessage,
+  authState: UpstreamAuthState,
+  contentLength: number
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${authState.bearerToken}`,
+    "content-type": "application/json",
+    "content-length": String(contentLength),
+    "accept-encoding": "identity",
+  };
+
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (value === undefined) {
+      continue;
+    }
+    const normalized = key.toLowerCase();
+    if (
+      normalized === "host" ||
+      normalized === "content-length" ||
+      normalized === "authorization" ||
+      normalized === "accept-encoding"
+    ) {
+      continue;
+    }
+    headers[normalized] = Array.isArray(value) ? value.join(", ") : value;
+  }
+
+  for (const [key, value] of Object.entries(authState.extraHeaders)) {
+    headers[key.toLowerCase()] = value;
+  }
+
+  return headers;
+}
+
+async function proxyChatgptCodexResponsesAsAnthropic(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  requestPath: string,
+  upstreamOrigin: URL,
+  authState: UpstreamAuthState,
+  overrideBody: JsonObject,
+  debugLogging: boolean
+): Promise<void> {
+  const rewrittenPath = rewriteRequestPathForChatgptCodex(upstreamOrigin, requestPath);
+  const upstreamUrl = buildUpstreamUrl(upstreamOrigin, rewrittenPath);
+
+  const upstreamPayload = {
+    ...overrideBody,
+    stream: true,
+  };
+  const upstreamPayloadString = JSON.stringify(upstreamPayload);
+  const headers = buildForwardHeaders(req, authState, Buffer.byteLength(upstreamPayloadString));
+
+  if (debugLogging) {
+    console.error(`claudex-proxy upstream request: ${req.method || "POST"} ${upstreamUrl.toString()}`);
+  }
+
+  const upstreamResponse = await fetch(upstreamUrl, {
+    method: "POST",
+    headers,
+    body: upstreamPayloadString,
+  });
+
+  const upstreamContentType = upstreamResponse.headers.get("content-type") || "unknown";
+  if (debugLogging) {
+    console.error(
+      `claudex-proxy upstream response: status=${upstreamResponse.status} url=${upstreamUrl.toString()} content_type=${upstreamContentType}`
+    );
+  }
+
+  if (upstreamResponse.status >= 400) {
+    const errorText = await upstreamResponse.text();
+    if (debugLogging) {
+      console.error(
+        `claudex-proxy upstream error: status=${upstreamResponse.status} url=${upstreamUrl.toString()} body=${errorText.slice(0, 300)}`
+      );
+    }
+    res.writeHead(upstreamResponse.status, { "content-type": "application/json" });
+    res.end(errorText);
+    return;
+  }
+
+  if (!upstreamResponse.body) {
+    writeJson(res, 502, {
+      type: "error",
+      error: {
+        type: "api_error",
+        message: "claudex-proxy received empty stream body from ChatGPT responses endpoint",
+      },
+    });
+    return;
+  }
+
+  const streamRequested = overrideBody.stream !== false;
+  const responseId = `msg_${Date.now().toString(16)}`;
+  let model = String(overrideBody.model || "");
+  let text = "";
+  let usageInputTokens = 0;
+  let usageOutputTokens = 0;
+  let streamStarted = false;
+
+  if (streamRequested) {
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+  }
+
+  const decoder = new TextDecoder();
+  let buffered = "";
+  const readable = Readable.fromWeb(upstreamResponse.body as any);
+  for await (const chunk of readable) {
+    buffered += decoder.decode(chunk as Buffer, { stream: true });
+
+    let boundary = buffered.indexOf("\n\n");
+    while (boundary !== -1) {
+      const rawEvent = buffered.slice(0, boundary);
+      buffered = buffered.slice(boundary + 2);
+
+      let eventName = "";
+      let dataText = "";
+      for (const line of rawEvent.split("\n")) {
+        if (line.startsWith("event:")) {
+          eventName = line.slice("event:".length).trim();
+        } else if (line.startsWith("data:")) {
+          dataText += line.slice("data:".length).trim();
+        }
+      }
+
+      if (!eventName || !dataText) {
+        boundary = buffered.indexOf("\n\n");
+        continue;
+      }
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(dataText);
+      } catch {
+        boundary = buffered.indexOf("\n\n");
+        continue;
+      }
+
+      if (parsed?.type === "response.created" && parsed?.response?.model) {
+        model = String(parsed.response.model);
+      }
+      if (parsed?.type === "response.output_text.delta" && typeof parsed.delta === "string") {
+        if (streamRequested && !streamStarted) {
+          streamStarted = true;
+          writeSseEvent(res, "message_start", {
+            type: "message_start",
+            message: {
+              id: responseId,
+              type: "message",
+              role: "assistant",
+              model,
+              content: [],
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
+          });
+          writeSseEvent(res, "content_block_start", {
+            type: "content_block_start",
+            index: 0,
+            content_block: {
+              type: "text",
+              text: "",
+            },
+          });
+        }
+
+        text += parsed.delta;
+        if (streamRequested) {
+          writeSseEvent(res, "content_block_delta", {
+            type: "content_block_delta",
+            index: 0,
+            delta: {
+              type: "text_delta",
+              text: parsed.delta,
+            },
+          });
+        }
+      }
+
+      if (parsed?.type === "response.completed") {
+        const completedUsage = parsed?.response?.usage;
+        usageInputTokens = Number(completedUsage?.input_tokens || 0);
+        usageOutputTokens = Number(completedUsage?.output_tokens || 0);
+        if (typeof parsed?.response?.model === "string" && parsed.response.model.length > 0) {
+          model = parsed.response.model;
+        }
+        if (!text && Array.isArray(parsed?.response?.output)) {
+          for (const item of parsed.response.output) {
+            if (!item || item.type !== "message" || !Array.isArray(item.content)) {
+              continue;
+            }
+            for (const part of item.content) {
+              if (part?.type === "output_text" && typeof part.text === "string") {
+                text += part.text;
+              }
+            }
+          }
+        }
+      }
+
+      boundary = buffered.indexOf("\n\n");
+    }
+  }
+
+  if (streamRequested) {
+    if (!streamStarted) {
+      writeSseEvent(res, "message_start", {
+        type: "message_start",
+        message: {
+          id: responseId,
+          type: "message",
+          role: "assistant",
+          model,
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      });
+      writeSseEvent(res, "content_block_start", {
+        type: "content_block_start",
+        index: 0,
+        content_block: {
+          type: "text",
+          text: "",
+        },
+      });
+    }
+
+    writeSseEvent(res, "content_block_stop", {
+      type: "content_block_stop",
+      index: 0,
+    });
+    writeSseEvent(res, "message_delta", {
+      type: "message_delta",
+      delta: {
+        stop_reason: "end_turn",
+        stop_sequence: null,
+      },
+      usage: {
+        output_tokens: usageOutputTokens,
+      },
+    });
+    writeSseEvent(res, "message_stop", { type: "message_stop" });
+    res.end();
+    return;
+  }
+
+  writeJson(res, 200, {
+    id: responseId,
+    type: "message",
+    role: "assistant",
+    model,
+    content: [
+      {
+        type: "text",
+        text,
+      },
+    ],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: {
+      input_tokens: usageInputTokens,
+      output_tokens: usageOutputTokens,
+    },
+  });
+}
+
 function persistRefreshedChatgptTokens(
   authPath: string,
   refreshed: {
@@ -518,7 +897,11 @@ async function proxyRaw(
     headers["content-length"] = String(outboundBody.length);
   }
 
-  const upstreamUrl = buildUpstreamUrl(upstreamOrigin, requestPath);
+  const rewrittenPath = rewriteRequestPathForChatgptCodex(upstreamOrigin, requestPath);
+  const upstreamUrl = buildUpstreamUrl(upstreamOrigin, rewrittenPath);
+  if (debugLogging) {
+    console.error(`claudex-proxy upstream request: ${req.method || "GET"} ${upstreamUrl.toString()}`);
+  }
   const upstreamResponse = await fetch(upstreamUrl, {
     method: req.method,
     headers,
@@ -538,7 +921,24 @@ async function proxyRaw(
     }
   }
 
-  res.writeHead(upstreamResponse.status, copyHeadersFromUpstream(upstreamResponse.headers));
+  const copiedHeaders = copyHeadersFromUpstream(upstreamResponse.headers);
+  if (debugLogging) {
+    const contentType = upstreamResponse.headers.get("content-type") || "unknown";
+    console.error(
+      `claudex-proxy upstream response: status=${upstreamResponse.status} url=${upstreamUrl.toString()} content_type=${contentType}`
+    );
+  }
+  if (debugLogging && upstreamResponse.status >= 400) {
+    const bodyPreview = await upstreamResponse.text();
+    console.error(
+      `claudex-proxy upstream error: status=${upstreamResponse.status} url=${upstreamUrl.toString()} body=${bodyPreview.slice(0, 300)}`
+    );
+    res.writeHead(upstreamResponse.status, copiedHeaders);
+    res.end(bodyPreview);
+    return;
+  }
+
+  res.writeHead(upstreamResponse.status, copiedHeaders);
   if (!upstreamResponse.body) {
     res.end();
     return;
@@ -639,24 +1039,58 @@ async function startProxy(
           preserveClientEffort: options.preserveClientEffort,
         });
         const removedToolFields = sanitizeToolFields(parsed);
+        if (isChatgptCodexEndpoint(upstreamOrigin) && typeof parsed.instructions !== "string") {
+          const inferredInstructions = extractInstructionsFromSystem(parsed.system);
+          if (inferredInstructions && inferredInstructions.length > 0) {
+            parsed.instructions = inferredInstructions;
+          }
+        }
+        if (isChatgptCodexEndpoint(upstreamOrigin)) {
+          parsed.input = toResponsesInput(parsed.messages);
+          const inferredEffort = parsed.output_config?.effort ?? parsed.reasoning?.effort;
+          if (typeof inferredEffort === "string" && inferredEffort.length > 0) {
+            parsed.reasoning = {
+              ...(parsed.reasoning && typeof parsed.reasoning === "object" ? parsed.reasoning : {}),
+              effort: inferredEffort,
+            };
+          }
+          delete parsed.messages;
+          delete parsed.system;
+          delete parsed.max_tokens;
+          delete parsed.max_output_tokens;
+          delete parsed.output_config;
+          delete parsed.thinking;
+          delete parsed.metadata;
+          delete parsed.tools;
+          parsed.store = false;
+        }
 
         if (options.debug) {
           const effort = parsed.output_config?.effort ?? parsed.reasoning?.effort ?? "unset";
+          const payloadKeys = Object.keys(parsed).join(",");
+          const firstMessagePreview =
+            Array.isArray(parsed.messages) && parsed.messages.length > 0
+              ? JSON.stringify(parsed.messages[0]).slice(0, 300)
+              : "none";
           console.error(
-            `claudex-proxy model remap: ${originalModel} -> ${options.forcedModel}, effort=${effort}, preserve_client_effort=${options.preserveClientEffort}, removed_tool_fields=${removedToolFields}`
+            `claudex-proxy model remap: ${originalModel} -> ${options.forcedModel}, effort=${effort}, preserve_client_effort=${options.preserveClientEffort}, removed_tool_fields=${removedToolFields}, payload_keys=[${payloadKeys}], first_message=${firstMessagePreview}`
           );
         }
 
-        await proxyRaw(
-          req,
-          res,
-          bodyBuffer,
-          url.pathname + url.search,
-          upstreamOrigin,
-          authState,
-          options.debug,
-          parsed
-        );
+        if (isChatgptCodexEndpoint(upstreamOrigin)) {
+          await proxyChatgptCodexResponsesAsAnthropic(
+            req,
+            res,
+            url.pathname + url.search,
+            upstreamOrigin,
+            authState,
+            parsed,
+            options.debug
+          );
+          return;
+        }
+
+        await proxyRaw(req, res, bodyBuffer, url.pathname + url.search, upstreamOrigin, authState, options.debug, parsed);
         return;
       }
 
