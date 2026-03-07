@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import {
   applyDefaultEffort,
   approxTokenCount,
+  extractInstructionsFromSystem,
   hasEffortFlag,
+  mapAnthropicToolChoiceToResponsesToolChoice,
+  mapAnthropicToolsToResponsesTools,
+  mapResponsesOutputToAnthropicContent,
   parseChatgptRefreshConfigFromAuthJson,
   parseChatgptTokenFromAuthJson,
   parseClaudexArgs,
@@ -10,6 +14,7 @@ import {
   parseCodexConfig,
   resolveUpstreamFromCodexConfig,
   sanitizeToolFields,
+  toResponsesInput,
 } from "../src/core.ts";
 
 describe("hasEffortFlag", () => {
@@ -202,5 +207,130 @@ describe("sanitizeToolFields", () => {
     const removed = sanitizeToolFields(body);
     expect(removed).toBe(1);
     expect(body.tools[0].defer_loading).toBeUndefined();
+  });
+});
+
+describe("extractInstructionsFromSystem", () => {
+  test("joins string and object text blocks", () => {
+    const text = extractInstructionsFromSystem(["alpha", { type: "text", text: "beta" }]);
+    expect(text).toBe("alpha\n\nbeta");
+  });
+});
+
+describe("toResponsesInput", () => {
+  test("maps text, tool_use and tool_result parts", () => {
+    const input = toResponsesInput([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Scanning files" },
+          { type: "tool_use", id: "toolu_1", name: "list_files", input: { path: "." } },
+        ],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "README.md\nsrc/" }],
+      },
+    ]);
+
+    expect(input[0]).toEqual({
+      role: "assistant",
+      content: [{ type: "output_text", text: "Scanning files" }],
+    });
+    expect(input[1]).toEqual({
+      type: "function_call",
+      call_id: "toolu_1",
+      name: "list_files",
+      arguments: JSON.stringify({ path: "." }),
+    });
+    expect(input[2]).toEqual({
+      type: "function_call_output",
+      call_id: "toolu_1",
+      output: "README.md\nsrc/",
+    });
+  });
+});
+
+describe("mapAnthropicToolsToResponsesTools", () => {
+  test("maps anthropic tool schema to responses function tool", () => {
+    const tools = mapAnthropicToolsToResponsesTools([
+      {
+        name: "read_file",
+        description: "Read file",
+        input_schema: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+          },
+          required: ["path"],
+        },
+      },
+    ]);
+
+    expect(tools).toEqual([
+      {
+        type: "function",
+        name: "read_file",
+        description: "Read file",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+          },
+          required: ["path"],
+        },
+      },
+    ]);
+  });
+});
+
+describe("mapAnthropicToolChoiceToResponsesToolChoice", () => {
+  test("maps type:any to required", () => {
+    expect(mapAnthropicToolChoiceToResponsesToolChoice({ type: "any" })).toBe("required");
+  });
+
+  test("maps explicit tool name to function choice", () => {
+    expect(mapAnthropicToolChoiceToResponsesToolChoice({ type: "tool", name: "read_file" })).toEqual({
+      type: "function",
+      name: "read_file",
+    });
+  });
+});
+
+describe("mapResponsesOutputToAnthropicContent", () => {
+  test("maps message output_text to anthropic text content", () => {
+    const mapped = mapResponsesOutputToAnthropicContent([
+      {
+        type: "message",
+        content: [{ type: "output_text", text: "Project has src and tests directories." }],
+      },
+    ]);
+    expect(mapped.stopReason).toBe("end_turn");
+    expect(mapped.content).toEqual([
+      {
+        type: "text",
+        text: "Project has src and tests directories.",
+      },
+    ]);
+  });
+
+  test("maps function_call to anthropic tool_use and tool_use stop reason", () => {
+    const mapped = mapResponsesOutputToAnthropicContent([
+      {
+        type: "function_call",
+        call_id: "call_1",
+        name: "read_file",
+        arguments: "{\"path\":\"README.md\"}",
+      },
+    ]);
+    expect(mapped.stopReason).toBe("tool_use");
+    expect(mapped.content).toEqual([
+      {
+        type: "tool_use",
+        id: "call_1",
+        name: "read_file",
+        input: { path: "README.md" },
+      },
+    ]);
   });
 });

@@ -10,7 +10,11 @@ import { homedir } from "node:os";
 import {
   applyDefaultEffort,
   approxTokenCount,
+  extractInstructionsFromSystem,
   hasEffortFlag,
+  mapAnthropicToolChoiceToResponsesToolChoice,
+  mapAnthropicToolsToResponsesTools,
+  mapResponsesOutputToAnthropicContent,
   parseChatgptRefreshConfigFromAuthJson,
   parseChatgptTokenFromAuthJson,
   parseClaudexArgs,
@@ -18,6 +22,7 @@ import {
   parseCodexConfig,
   resolveUpstreamFromCodexConfig,
   sanitizeToolFields,
+  toResponsesInput,
   type JsonObject,
 } from "./core.ts";
 
@@ -63,6 +68,8 @@ interface ProxyOptions {
   defaultReasoningEffort: string;
   preserveClientEffort: boolean;
   debug: boolean;
+  safeMode: boolean;
+  workspaceSummary?: string;
 }
 
 interface UpstreamAuthState {
@@ -120,6 +127,63 @@ function resolveCodexPaths(): { configPath: string; authPath: string } {
   const configPath = process.env.CLAUDEX_CODEX_CONFIG?.trim() || join(codexHome, "config.toml");
   const authPath = process.env.CLAUDEX_CODEX_AUTH?.trim() || join(codexHome, "auth.json");
   return { configPath, authPath };
+}
+
+function buildWorkspaceSummary(rootDir: string): string | undefined {
+  try {
+    const ignored = new Set([
+      ".git",
+      "node_modules",
+      "dist",
+      ".DS_Store",
+      ".idea",
+      ".vscode",
+    ]);
+    const topEntries = readdirSync(rootDir, { withFileTypes: true })
+      .filter((entry) => !ignored.has(entry.name))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+
+    const dirs = topEntries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+    const files = topEntries.filter((entry) => entry.isFile()).map((entry) => entry.name);
+    const lines: string[] = [];
+    lines.push(`cwd: ${rootDir}`);
+    lines.push(`top-level dirs: ${dirs.slice(0, 20).join(", ") || "(none)"}`);
+    lines.push(`top-level files: ${files.slice(0, 30).join(", ") || "(none)"}`);
+
+    const inspectDirs = ["src", "tests", "scripts"];
+    for (const dirName of inspectDirs) {
+      const dirPath = join(rootDir, dirName);
+      if (!existsSync(dirPath)) {
+        continue;
+      }
+      try {
+        const children = readdirSync(dirPath, { withFileTypes: true })
+          .filter((entry) => entry.isFile())
+          .map((entry) => entry.name)
+          .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+        lines.push(`${dirName}/ files: ${children.slice(0, 30).join(", ") || "(none)"}`);
+      } catch {
+        // ignore directory scan errors
+      }
+    }
+
+    const readmePath = join(rootDir, "README.md");
+    if (existsSync(readmePath)) {
+      try {
+        const readmePreview = readFileSync(readmePath, "utf8").split("\n").slice(0, 24).join("\n");
+        if (readmePreview.trim().length > 0) {
+          lines.push("README.md preview:");
+          lines.push(readmePreview);
+        }
+      } catch {
+        // ignore README read errors
+      }
+    }
+
+    return lines.join("\n");
+  } catch {
+    return undefined;
+  }
 }
 
 function loadRuntimeConfig(): RuntimeConfig {
@@ -369,87 +433,6 @@ function isChatgptCodexEndpoint(upstreamOrigin: URL): boolean {
   return upstreamOrigin.hostname === "chatgpt.com" && basePath.startsWith("/backend-api/codex");
 }
 
-function extractInstructionsFromSystem(systemField: unknown): string | undefined {
-  if (typeof systemField === "string" && systemField.trim().length > 0) {
-    return systemField.trim();
-  }
-  if (!Array.isArray(systemField)) {
-    return undefined;
-  }
-
-  const parts: string[] = [];
-  for (const item of systemField) {
-    if (typeof item === "string" && item.trim().length > 0) {
-      parts.push(item.trim());
-      continue;
-    }
-    if (item && typeof item === "object") {
-      const text = (item as Record<string, unknown>).text;
-      if (typeof text === "string" && text.trim().length > 0) {
-        parts.push(text.trim());
-      }
-    }
-  }
-
-  if (parts.length === 0) {
-    return undefined;
-  }
-  return parts.join("\n\n");
-}
-
-function toResponsesInput(messages: unknown): Array<Record<string, unknown>> {
-  if (!Array.isArray(messages)) {
-    return [];
-  }
-
-  const mapped: Array<Record<string, unknown>> = [];
-  for (const message of messages) {
-    if (!message || typeof message !== "object") {
-      continue;
-    }
-    const roleRaw = (message as Record<string, unknown>).role;
-    const role = typeof roleRaw === "string" ? roleRaw : "user";
-    const contentRaw = (message as Record<string, unknown>).content;
-
-    const parts: Array<Record<string, unknown>> = [];
-    if (typeof contentRaw === "string") {
-      parts.push({
-        type: role === "assistant" ? "output_text" : "input_text",
-        text: contentRaw,
-      });
-    } else if (Array.isArray(contentRaw)) {
-      for (const part of contentRaw) {
-        if (typeof part === "string") {
-          parts.push({
-            type: role === "assistant" ? "output_text" : "input_text",
-            text: part,
-          });
-          continue;
-        }
-        if (!part || typeof part !== "object") {
-          continue;
-        }
-        const text = (part as Record<string, unknown>).text;
-        if (typeof text === "string" && text.length > 0) {
-          parts.push({
-            type: role === "assistant" ? "output_text" : "input_text",
-            text,
-          });
-        }
-      }
-    }
-
-    if (parts.length === 0) {
-      continue;
-    }
-    mapped.push({
-      role,
-      content: parts,
-    });
-  }
-  return mapped;
-}
-
 function writeSseEvent(res: http.ServerResponse, event: string, data: unknown): void {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -553,17 +536,10 @@ async function proxyChatgptCodexResponsesAsAnthropic(
   const responseId = `msg_${Date.now().toString(16)}`;
   let model = String(overrideBody.model || "");
   let text = "";
+  let parsedContent: Array<Record<string, unknown>> = [];
+  let stopReason: "tool_use" | "end_turn" = "end_turn";
   let usageInputTokens = 0;
   let usageOutputTokens = 0;
-  let streamStarted = false;
-
-  if (streamRequested) {
-    res.writeHead(200, {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    });
-  }
 
   const decoder = new TextDecoder();
   let buffered = "";
@@ -603,42 +579,7 @@ async function proxyChatgptCodexResponsesAsAnthropic(
         model = String(parsed.response.model);
       }
       if (parsed?.type === "response.output_text.delta" && typeof parsed.delta === "string") {
-        if (streamRequested && !streamStarted) {
-          streamStarted = true;
-          writeSseEvent(res, "message_start", {
-            type: "message_start",
-            message: {
-              id: responseId,
-              type: "message",
-              role: "assistant",
-              model,
-              content: [],
-              stop_reason: null,
-              stop_sequence: null,
-              usage: { input_tokens: 0, output_tokens: 0 },
-            },
-          });
-          writeSseEvent(res, "content_block_start", {
-            type: "content_block_start",
-            index: 0,
-            content_block: {
-              type: "text",
-              text: "",
-            },
-          });
-        }
-
         text += parsed.delta;
-        if (streamRequested) {
-          writeSseEvent(res, "content_block_delta", {
-            type: "content_block_delta",
-            index: 0,
-            delta: {
-              type: "text_delta",
-              text: parsed.delta,
-            },
-          });
-        }
       }
 
       if (parsed?.type === "response.completed") {
@@ -648,17 +589,16 @@ async function proxyChatgptCodexResponsesAsAnthropic(
         if (typeof parsed?.response?.model === "string" && parsed.response.model.length > 0) {
           model = parsed.response.model;
         }
-        if (!text && Array.isArray(parsed?.response?.output)) {
-          for (const item of parsed.response.output) {
-            if (!item || item.type !== "message" || !Array.isArray(item.content)) {
-              continue;
-            }
-            for (const part of item.content) {
-              if (part?.type === "output_text" && typeof part.text === "string") {
-                text += part.text;
-              }
-            }
+        if (Array.isArray(parsed?.response?.output)) {
+          if (debugLogging) {
+            const outputTypes = parsed.response.output
+              .map((item: any) => (item && typeof item.type === "string" ? item.type : "unknown"))
+              .join(",");
+            console.error(`claudex-proxy responses output types: [${outputTypes}]`);
           }
+          const mapped = mapResponsesOutputToAnthropicContent(parsed.response.output);
+          parsedContent = mapped.content;
+          stopReason = mapped.stopReason;
         }
       }
 
@@ -666,39 +606,89 @@ async function proxyChatgptCodexResponsesAsAnthropic(
     }
   }
 
+  if (parsedContent.length === 0 && text.length > 0) {
+    parsedContent = [{ type: "text", text }];
+  }
+  if (debugLogging) {
+    const contentKinds = parsedContent.map((block) => String(block.type || "unknown")).join(",");
+    const toolUseSummaries = parsedContent
+      .filter((block) => block.type === "tool_use")
+      .map((block) => {
+        const name = typeof block.name === "string" ? block.name : "unknown";
+        const input = block.input;
+        const keys =
+          input && typeof input === "object" && !Array.isArray(input) ? Object.keys(input).join("|") : "";
+        return `${name}(${keys})`;
+      })
+      .join(",");
+    console.error(
+      `claudex-proxy mapped response summary: blocks=${parsedContent.length}, stop_reason=${stopReason}, content_types=[${contentKinds}], tool_uses=[${toolUseSummaries}], fallback_text_len=${text.length}`
+    );
+  }
+
   if (streamRequested) {
-    if (!streamStarted) {
-      writeSseEvent(res, "message_start", {
-        type: "message_start",
-        message: {
-          id: responseId,
-          type: "message",
-          role: "assistant",
-          model,
-          content: [],
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
-        },
-      });
-      writeSseEvent(res, "content_block_start", {
-        type: "content_block_start",
-        index: 0,
-        content_block: {
-          type: "text",
-          text: "",
-        },
-      });
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    writeSseEvent(res, "message_start", {
+      type: "message_start",
+      message: {
+        id: responseId,
+        type: "message",
+        role: "assistant",
+        model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    });
+
+    for (let index = 0; index < parsedContent.length; index += 1) {
+      const block = parsedContent[index];
+      if (block.type === "text") {
+        writeSseEvent(res, "content_block_start", {
+          type: "content_block_start",
+          index,
+          content_block: {
+            type: "text",
+            text: "",
+          },
+        });
+        writeSseEvent(res, "content_block_delta", {
+          type: "content_block_delta",
+          index,
+          delta: {
+            type: "text_delta",
+            text: typeof block.text === "string" ? block.text : "",
+          },
+        });
+        writeSseEvent(res, "content_block_stop", {
+          type: "content_block_stop",
+          index,
+        });
+        continue;
+      }
+
+      if (block.type === "tool_use") {
+        writeSseEvent(res, "content_block_start", {
+          type: "content_block_start",
+          index,
+          content_block: block,
+        });
+        writeSseEvent(res, "content_block_stop", {
+          type: "content_block_stop",
+          index,
+        });
+      }
     }
 
-    writeSseEvent(res, "content_block_stop", {
-      type: "content_block_stop",
-      index: 0,
-    });
     writeSseEvent(res, "message_delta", {
       type: "message_delta",
       delta: {
-        stop_reason: "end_turn",
+        stop_reason: stopReason,
         stop_sequence: null,
       },
       usage: {
@@ -715,13 +705,8 @@ async function proxyChatgptCodexResponsesAsAnthropic(
     type: "message",
     role: "assistant",
     model,
-    content: [
-      {
-        type: "text",
-        text,
-      },
-    ],
-    stop_reason: "end_turn",
+    content: parsedContent,
+    stop_reason: stopReason,
     stop_sequence: null,
     usage: {
       input_tokens: usageInputTokens,
@@ -1047,6 +1032,50 @@ async function startProxy(
         }
         if (isChatgptCodexEndpoint(upstreamOrigin)) {
           parsed.input = toResponsesInput(parsed.messages);
+          if (options.debug && Array.isArray(parsed.input)) {
+            const inputItemKinds = parsed.input
+              .map((item: any) => (item && typeof item.type === "string" ? item.type : "message"))
+              .slice(0, 8);
+            const functionCallOutputCount = parsed.input.filter(
+              (item: any) => item && item.type === "function_call_output"
+            ).length;
+            console.error(
+              `claudex-proxy responses input summary: items=${parsed.input.length}, first_types=[${inputItemKinds.join(",")}], function_call_output_count=${functionCallOutputCount}`
+            );
+          }
+          const mappedTools = mapAnthropicToolsToResponsesTools(parsed.tools);
+          const filteredMappedTools =
+            options.safeMode
+              ? mappedTools.filter((tool) => String(tool.name || "").trim().toLowerCase() !== "toolsearch")
+              : mappedTools;
+          if (options.debug) {
+            const mappedToolNames = filteredMappedTools
+              .map((tool) => String(tool.name || "").trim())
+              .filter((name) => name.length > 0)
+              .slice(0, 10)
+              .join(",");
+            console.error(
+              `claudex-proxy tool map summary: original=${mappedTools.length}, filtered=${filteredMappedTools.length}, safe_mode=${options.safeMode}, first_tools=[${mappedToolNames}]`
+            );
+          }
+          if (filteredMappedTools.length === 0 && options.workspaceSummary && options.workspaceSummary.length > 0) {
+            const existingInstructions = typeof parsed.instructions === "string" ? parsed.instructions : "";
+            parsed.instructions = `${existingInstructions}\n\nLocal workspace snapshot (autogenerated):\n${options.workspaceSummary}\n\nWhen asked about this folder/project, answer concretely and immediately from this snapshot. Do not say you will inspect or check files. Do not ask for extra time before answering.`.trim();
+            if (options.debug) {
+              console.error("claudex-proxy injected workspace summary into instructions (no tools available)");
+            }
+          }
+          if (filteredMappedTools.length > 0) {
+            parsed.tools = filteredMappedTools;
+          } else {
+            delete parsed.tools;
+          }
+          const mappedToolChoice = mapAnthropicToolChoiceToResponsesToolChoice(parsed.tool_choice);
+          if (mappedToolChoice !== undefined) {
+            parsed.tool_choice = mappedToolChoice;
+          } else {
+            delete parsed.tool_choice;
+          }
           const inferredEffort = parsed.output_config?.effort ?? parsed.reasoning?.effort;
           if (typeof inferredEffort === "string" && inferredEffort.length > 0) {
             parsed.reasoning = {
@@ -1061,7 +1090,6 @@ async function startProxy(
           delete parsed.output_config;
           delete parsed.thinking;
           delete parsed.metadata;
-          delete parsed.tools;
           parsed.store = false;
         }
 
@@ -1131,6 +1159,7 @@ async function main(): Promise<void> {
 
   const listenHost = process.env.CLAUDEX_LISTEN_HOST || "127.0.0.1";
   const listenPort = process.env.CLAUDEX_PORT ? Number(process.env.CLAUDEX_PORT) : await pickFreePort(listenHost);
+  const workspaceSummary = buildWorkspaceSummary(process.cwd());
   if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
     fail("invalid CLAUDEX_PORT value");
   }
@@ -1147,6 +1176,8 @@ async function main(): Promise<void> {
       defaultReasoningEffort,
       preserveClientEffort,
       debug,
+      safeMode,
+      workspaceSummary,
     }
   );
 
