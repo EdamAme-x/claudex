@@ -1,4 +1,10 @@
 *
+node_modules/
+dist/
+*.tgz
+.DS_Store
+*.bun-build
+*.fileloc
 
 !.gitignore
 !.gitattributes
@@ -9,14 +15,12 @@
 !.github/workflows/**
 !README.md
 !package.json
-!bun.lock
+!package-lock.json
 !tsconfig.json
-!claudex
+!esbuild.config.mjs
 !scripts/
 !scripts/**
 !src/
 !src/**
-!tests/
-!tests/**
 !.githooks/
 !.githooks/**

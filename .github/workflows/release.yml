@@ -1,111 +1,347 @@
-name: Auto Release claudex
+name: Release
 
 on:
   push:
-    branches:
-      - main
-  schedule:
-    - cron: "17 0 * * *"
-  workflow_dispatch:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
 
-concurrency:
-  group: claudex-auto-release
-  cancel-in-progress: false
-
 jobs:
-  auto-release:
-    runs-on: macos-latest
+  # ─── Linux binaries + packages ───
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+        include:
+          - arch: x64
+            bun_target: bun-linux-x64
+            deb_arch: amd64
+            rpm_arch: x86_64
+            appimage_arch: x86_64
+          - arch: arm64
+            bun_target: bun-linux-arm64
+            deb_arch: arm64
+            rpm_arch: aarch64
+            appimage_arch: aarch64
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
 
-      - name: Detect latest upstream version
-        id: detect
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Stub react-devtools-core
+      - run: |
+          mkdir -p node_modules/react-devtools-core
+          echo '{"name":"react-devtools-core","version":"0.0.0","main":"index.js"}' > node_modules/react-devtools-core/package.json
+          echo 'module.exports={};' > node_modules/react-devtools-core/index.js
+
+      - name: Set version
+        id: ver
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      # Build binary
+      - name: Build binary
         run: |
-          set -euo pipefail
+          mkdir -p dist/bin
+          bun build src/index.tsx --compile --target=${{ matrix.bun_target }} \
+            --outfile=dist/bin/claudex-linux-${{ matrix.arch }}
 
-          installer_url="https://claude.ai/install.sh"
-          installer_script="$(curl -fsSL "${installer_url}")"
-          bucket="$(printf '%s\n' "${installer_script}" | awk -F'"' '/^GCS_BUCKET=/{print $2; exit}')"
-          if [[ -z "${bucket}" ]]; then
-            echo "Failed to extract GCS_BUCKET from installer script: ${installer_url}"
-            exit 1
-          fi
+      # tar.gz
+      - name: Package tar.gz
+        run: |
+          mkdir -p dist/packages staging/claudex-${{ steps.ver.outputs.VERSION }}
+          cp dist/bin/claudex-linux-${{ matrix.arch }} staging/claudex-${{ steps.ver.outputs.VERSION }}/claudex
+          chmod +x staging/claudex-${{ steps.ver.outputs.VERSION }}/claudex
+          printf '#!/bin/bash\nset -e\nsudo cp claudex /usr/local/bin/claudex\nsudo chmod +x /usr/local/bin/claudex\necho "claudex installed!"' \
+            > staging/claudex-${{ steps.ver.outputs.VERSION }}/install.sh
+          chmod +x staging/claudex-${{ steps.ver.outputs.VERSION }}/install.sh
+          tar -czf dist/packages/claudex-${{ steps.ver.outputs.VERSION }}-linux-${{ matrix.arch }}.tar.gz -C staging .
 
-          latest="$(curl -fsSL "$bucket/latest" | tr -d '\r\n')"
-          if [[ -z "$latest" ]]; then
-            echo "Failed to read latest version"
-            exit 1
-          fi
+      # .deb
+      - name: Package .deb
+        run: |
+          mkdir -p deb/DEBIAN deb/usr/local/bin
+          cp dist/bin/claudex-linux-${{ matrix.arch }} deb/usr/local/bin/claudex
+          chmod +x deb/usr/local/bin/claudex
+          cat > deb/DEBIAN/control << EOF
+          Package: claudex
+          Version: ${{ steps.ver.outputs.VERSION }}
+          Architecture: ${{ matrix.deb_arch }}
+          Maintainer: claudex
+          Description: Claude Code UI + OpenAI models CLI
+          EOF
+          # Fix control file formatting (remove leading spaces)
+          sed -i 's/^          //' deb/DEBIAN/control
+          dpkg-deb --build deb dist/packages/claudex-${{ steps.ver.outputs.VERSION }}-linux-${{ matrix.deb_arch }}.deb
 
-          base_tag="claude-v${latest}"
+      # .rpm
+      - name: Package .rpm
+        run: |
+          sudo apt-get install -y rpm 2>/dev/null || true
+          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT/usr/local/bin}
+          cp dist/bin/claudex-linux-${{ matrix.arch }} rpmbuild/BUILDROOT/usr/local/bin/claudex
+          chmod +x rpmbuild/BUILDROOT/usr/local/bin/claudex
+          cat > rpmbuild/SPECS/claudex.spec << 'EOF'
+          Name: claudex
+          Version: ${{ steps.ver.outputs.VERSION }}
+          Release: 1
+          Summary: Claude Code UI + OpenAI models CLI
+          License: MIT
+          AutoReqProv: no
+          %description
+          Interactive coding assistant with Claude Code UI and OpenAI models.
+          %install
+          mkdir -p %{buildroot}/usr/local/bin
+          cp %{_topdir}/BUILDROOT/usr/local/bin/claudex %{buildroot}/usr/local/bin/
+          %files
+          /usr/local/bin/claudex
+          EOF
+          sed -i 's/^          //' rpmbuild/SPECS/claudex.spec
+          rpmbuild --define "_topdir $(pwd)/rpmbuild" -bb rpmbuild/SPECS/claudex.spec || true
+          cp rpmbuild/RPMS/*/*.rpm dist/packages/ 2>/dev/null || true
 
-          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            should_release="true"
-            tag="${base_tag}-build.${GITHUB_RUN_NUMBER}"
-            release_name="claudex build #${GITHUB_RUN_NUMBER} for Claude Code ${latest}"
-            echo "Push event: creating rolling build release ${tag}"
-          else
-            status="$(curl -s -o /dev/null -w '%{http_code}' \
-              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${base_tag}")"
+      # .AppImage
+      - name: Package .AppImage
+        run: |
+          mkdir -p AppDir/usr/bin
+          cp dist/bin/claudex-linux-${{ matrix.arch }} AppDir/usr/bin/claudex
+          chmod +x AppDir/usr/bin/claudex
+          cat > AppDir/claudex.desktop << 'EOF'
+          [Desktop Entry]
+          Name=claudex
+          Exec=claudex
+          Icon=claudex
+          Type=Application
+          Terminal=true
+          Categories=Development;
+          EOF
+          sed -i 's/^          //' AppDir/claudex.desktop
+          mkdir -p AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          cp AppDir/claudex.desktop AppDir/usr/share/applications/
+          # Minimal icon
+          convert -size 256x256 xc:cyan AppDir/usr/share/icons/hicolor/256x256/apps/claudex.png 2>/dev/null || \
+            printf '\x89PNG\r\n\x1a\n' > AppDir/usr/share/icons/hicolor/256x256/apps/claudex.png
+          printf '#!/bin/bash\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/bin/claudex" "$@"' > AppDir/AppRun
+          chmod +x AppDir/AppRun
+          wget -q "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.appimage_arch }}.AppImage" -O appimagetool && \
+            chmod +x appimagetool && \
+            ARCH=${{ matrix.appimage_arch }} ./appimagetool AppDir \
+              "dist/packages/claudex-${{ steps.ver.outputs.VERSION }}-linux-${{ matrix.appimage_arch }}.AppImage" || \
+            echo "AppImage skipped"
 
-            if [[ "$status" == "200" ]]; then
-              should_release="false"
-              echo "Release already exists for ${base_tag}. Skipping build."
-            elif [[ "$status" == "404" ]]; then
-              should_release="true"
-              echo "New upstream version ${latest} detected."
-            else
-              echo "GitHub API returned unexpected status: ${status}"
-              exit 1
-            fi
-
-            tag="${base_tag}"
-            release_name="claudex for Claude Code ${latest}"
-          fi
-
-          echo "latest_version=${latest}" >> "$GITHUB_OUTPUT"
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "release_name=${release_name}" >> "$GITHUB_OUTPUT"
-          echo "bucket=${bucket}" >> "$GITHUB_OUTPUT"
-          echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
-
-      - name: Setup Bun
-        if: steps.detect.outputs.should_release == 'true'
-        uses: oven-sh/setup-bun@v2
+      - uses: actions/upload-artifact@v4
         with:
-          bun-version: latest
+          name: pkg-linux-${{ matrix.arch }}
+          path: dist/packages/*
 
-      - name: Build release binaries and macOS packages
-        if: steps.detect.outputs.should_release == 'true'
-        env:
-          CLAUDEX_PKG_VERSION: ${{ steps.detect.outputs.latest_version }}
+  # ─── macOS binaries + packages ───
+  macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+        include:
+          - arch: x64
+            bun_target: bun-darwin-x64
+          - arch: arm64
+            bun_target: bun-darwin-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+
+      - run: |
+          mkdir -p node_modules/react-devtools-core
+          echo '{"name":"react-devtools-core","version":"0.0.0","main":"index.js"}' > node_modules/react-devtools-core/package.json
+          echo 'module.exports={};' > node_modules/react-devtools-core/index.js
+
+      - name: Set version
+        id: ver
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Build binary
         run: |
-          set -euo pipefail
-          bun run build:release
+          mkdir -p dist/bin
+          bun build src/index.tsx --compile --target=${{ matrix.bun_target }} \
+            --outfile=dist/bin/claudex-darwin-${{ matrix.arch }}
 
-      - name: Publish GitHub release
-        if: steps.detect.outputs.should_release == 'true'
+      # .pkg
+      - name: Package .pkg
+        run: |
+          mkdir -p dist/packages staging/usr/local/bin
+          cp dist/bin/claudex-darwin-${{ matrix.arch }} staging/usr/local/bin/claudex
+          chmod +x staging/usr/local/bin/claudex
+          pkgbuild --root staging --identifier com.claudex.cli \
+            --version ${{ steps.ver.outputs.VERSION }} --install-location / \
+            dist/packages/claudex-${{ steps.ver.outputs.VERSION }}-macos-${{ matrix.arch }}.pkg
+
+      # .dmg
+      - name: Package .dmg
+        run: |
+          mkdir -p dmg_content
+          cp dist/bin/claudex-darwin-${{ matrix.arch }} dmg_content/claudex
+          chmod +x dmg_content/claudex
+          printf '#!/bin/bash\nDIR="$(cd "$(dirname "$0")" && pwd)"\nsudo cp "$DIR/claudex" /usr/local/bin/claudex\nsudo chmod +x /usr/local/bin/claudex\necho "Done! Run: claudex"\nread -p "Press Enter..."' > dmg_content/install.command
+          chmod +x dmg_content/install.command
+          hdiutil create -volname "claudex-${{ steps.ver.outputs.VERSION }}" \
+            -srcfolder dmg_content -ov -format UDZO \
+            dist/packages/claudex-${{ steps.ver.outputs.VERSION }}-macos-${{ matrix.arch }}.dmg
+
+      # tar.gz
+      - name: Package tar.gz
+        run: |
+          mkdir -p tarball/claudex-${{ steps.ver.outputs.VERSION }}
+          cp dist/bin/claudex-darwin-${{ matrix.arch }} tarball/claudex-${{ steps.ver.outputs.VERSION }}/claudex
+          chmod +x tarball/claudex-${{ steps.ver.outputs.VERSION }}/claudex
+          tar -czf dist/packages/claudex-${{ steps.ver.outputs.VERSION }}-macos-${{ matrix.arch }}.tar.gz -C tarball .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-macos-${{ matrix.arch }}
+          path: dist/packages/*
+
+  # ─── Windows binaries + packages ───
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        arch: [x64]
+        include:
+          - arch: x64
+            bun_target: bun-windows-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+
+      - name: Stub devtools
+        shell: bash
+        run: |
+          mkdir -p node_modules/react-devtools-core
+          echo '{"name":"react-devtools-core","version":"0.0.0","main":"index.js"}' > node_modules/react-devtools-core/package.json
+          echo 'module.exports={};' > node_modules/react-devtools-core/index.js
+
+      - name: Set version
+        id: ver
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Build binary
+        shell: bash
+        run: |
+          mkdir -p dist/bin
+          bun build src/index.tsx --compile --target=${{ matrix.bun_target }} \
+            --outfile=dist/bin/claudex-windows-${{ matrix.arch }}.exe
+
+      # .zip
+      - name: Package .zip
+        shell: bash
+        run: |
+          mkdir -p dist/packages
+          cd dist/bin
+          7z a "../packages/claudex-${{ steps.ver.outputs.VERSION }}-windows-${{ matrix.arch }}.zip" \
+            "claudex-windows-${{ matrix.arch }}.exe"
+
+      # NSIS installer
+      - name: Package NSIS installer
+        shell: pwsh
+        run: |
+          $version = "${{ steps.ver.outputs.VERSION }}"
+          $arch = "${{ matrix.arch }}"
+          $binPath = "$(Get-Location)\dist\bin\claudex-windows-${arch}.exe"
+          $outPath = "$(Get-Location)\dist\packages\claudex-${version}-windows-${arch}-setup.exe"
+
+          @"
+          !include "MUI2.nsh"
+          Name "claudex ${version}"
+          OutFile "${outPath}"
+          InstallDir "`$LOCALAPPDATA\claudex"
+          RequestExecutionLevel user
+          !insertmacro MUI_PAGE_WELCOME
+          !insertmacro MUI_PAGE_DIRECTORY
+          !insertmacro MUI_PAGE_INSTFILES
+          !insertmacro MUI_PAGE_FINISH
+          !insertmacro MUI_LANGUAGE "English"
+          Section "Install"
+            SetOutPath "`$INSTDIR\bin"
+            File "/oname=claudex.exe" "${binPath}"
+            WriteRegStr HKCU "Environment" "Path" "`$INSTDIR\bin;$%Path%"
+            SendMessage 0xFFFF 0x001A 0 "STR:Environment" /TIMEOUT=500
+          SectionEnd
+          Section "Uninstall"
+            Delete "`$INSTDIR\bin\claudex.exe"
+            RMDir "`$INSTDIR\bin"
+            RMDir "`$INSTDIR"
+          SectionEnd
+          "@ | Set-Content -Path "installer.nsi"
+
+          choco install nsis -y 2>$null
+          makensis installer.nsi 2>$null
+          if (-not $?) { Write-Host "NSIS installer build skipped" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-windows-${{ matrix.arch }}
+          path: dist/packages/*
+
+  # ─── Create Release ───
+  release:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set version
+        id: ver
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          path: packages
+          merge-multiple: true
+
+      - name: List packages
+        run: find packages -type f | sort
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.detect.outputs.tag }}
-          name: ${{ steps.detect.outputs.release_name }}
+          name: "claudex v${{ steps.ver.outputs.VERSION }}"
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          generate_release_notes: true
           body: |
-            Automated release for Claude Code version `${{ steps.detect.outputs.latest_version }}`.
-            Bundled with Bun compile targets for Linux, macOS, and Windows.
-            Source bucket: `${{ steps.detect.outputs.bucket }}`.
-          files: |
-            dist/claudex-linux-x64
-            dist/claudex-linux-arm64
-            dist/claudex-macos-x64
-            dist/claudex-macos-arm64
-            dist/claudex-macos-x64.pkg
-            dist/claudex-macos-arm64.pkg
-            dist/claudex-windows-x64.exe
+            ## claudex v${{ steps.ver.outputs.VERSION }}
+
+            Claude Code UI + OpenAI models. Login with your ChatGPT account — no API key needed.
+
+            ### Install
+
+            | Platform | File | Install |
+            |----------|------|---------|
+            | **macOS (Apple Silicon)** | `.pkg` | Double-click to install |
+            | **macOS (Intel)** | `.pkg` | Double-click to install |
+            | **Linux x64** | `.deb` | `sudo dpkg -i claudex-*.deb` |
+            | **Linux x64** | `.rpm` | `sudo rpm -i claudex-*.rpm` |
+            | **Linux arm64** | `.deb` | `sudo dpkg -i claudex-*.deb` |
+            | **Linux** | `.tar.gz` | Extract & run `./install.sh` |
+            | **Linux** | `.AppImage` | `chmod +x *.AppImage && ./*.AppImage` |
+            | **Windows x64** | `-setup.exe` | Run installer |
+            | **Windows x64** | `.zip` | Extract & add to PATH |
+
+            ### First run
+            ```
+            claudex
+            ```
+            The setup wizard will guide you through theme, permission mode, model selection, and ChatGPT login.
+
+            ### Quick start
+            ```bash
+            claudex login         # Login with ChatGPT account
+            claudex               # Start interactive session
+            claudex -p "fix bug"  # One-shot prompt
+            claudex --model o3    # Use specific model
+            ```
+          files: packages/*

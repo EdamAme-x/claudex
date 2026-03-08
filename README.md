@@ -1,78 +1,121 @@
 # claudex
 
-`claudex` is a Bun-based launcher that runs Claude Code against an OpenAI-compatible endpoint.
+Claude Code UI + OpenAI models. ChatGPT account login — no API key needed.
 
-You can download binaries from [Releases](https://github.com/EdamAme-x/claudex/releases).
+## Features
 
-## Local usage
+- Claude Code-like interactive TUI (built with Ink/React)
+- Uses OpenAI models (o4-mini, gpt-4.1, o3, o3-pro, etc.)
+- Built-in tools: Bash, Read, Write, Edit, Glob, Grep
+- Setup wizard on first run (theme, permission mode, model selection)
+- One-shot mode with `-p` flag
 
-0. Install dependencies:
+## Install
+
+### macOS
+
+**Homebrew (coming soon)**
+
+**Installer (.pkg)**
+
+Download `claudex-*-macos-arm64.pkg` (Apple Silicon) or `claudex-*-macos-x64.pkg` (Intel) from [Releases](../../releases) and double-click to install.
+
+**DMG**
+
+Download the `.dmg`, open it, and run `install.command`.
+
+**tar.gz**
 
 ```bash
-bun install
+tar xzf claudex-*-macos-*.tar.gz
+cd claudex-*
+sudo cp claudex /usr/local/bin/
 ```
 
-1. Ensure Codex auth file exists (config is optional but recommended):
+### Linux
 
-```text
-~/.codex/auth.json
-~/.codex/config.toml
-```
-
-2. Run:
+**Debian / Ubuntu (.deb)**
 
 ```bash
-./claudex
+sudo dpkg -i claudex-*-linux-amd64.deb
 ```
 
-Wrapper flags:
+**Fedora / RHEL (.rpm)**
 
-- `--no-safe`: disables `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` for that run.
-- By default, `claudex` enables safe mode (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`).
+```bash
+sudo rpm -i claudex-*-linux-*.rpm
+```
 
-Optional environment variables:
+**AppImage**
 
-- `CLAUDEX_FORCE_MODEL` (default: value of `model` from `~/.codex/config.toml`; fallback: `gpt-5.3-codex`)
-- `CLAUDEX_DEFAULT_REASONING_EFFORT` (default: `xhigh`)
-- `CLAUDEX_CLAUDE_BIN`
-- `CLAUDEX_CODEX_CONFIG` (overrides `~/.codex/config.toml`)
-- `CLAUDEX_CODEX_AUTH` (overrides `~/.codex/auth.json`)
-- `CLAUDEX_MODEL_PROVIDER` (overrides `model_provider` selection)
-- `CLAUDEX_UPSTREAM_BASE_URL` (force endpoint URL)
-- `CLAUDEX_UPSTREAM_API_KEY` (force API key)
-- `CLAUDEX_UPSTREAM_BEARER_TOKEN` (force bearer token for ChatGPT token mode)
-- `CLAUDEX_CHATGPT_BEARER_TOKEN` (alias of `CLAUDEX_UPSTREAM_BEARER_TOKEN`)
-- `CLAUDEX_CHATGPT_ACCOUNT_ID` (override `ChatGPT-Account-Id` header)
-- `CLAUDEX_CHATGPT_BASE_URL` (default: `https://chatgpt.com/backend-api/codex`)
-- `CLAUDEX_CHATGPT_DEFAULT_MODEL` (default: `gpt-5-codex` when ChatGPT mode is active and no model is explicitly configured)
-- `CLAUDEX_FORCE_LOGIN_METHOD` (default: `console`; set to `none` to disable injection)
-- `CLAUDEX_PORT`
-- `CLAUDEX_DEBUG=1`
+```bash
+chmod +x claudex-*-linux-*.AppImage
+./claudex-*-linux-*.AppImage
+```
 
-Authentication note:
+**tar.gz**
 
-- Priority is:
-  1. Use `model_provider` / `CLAUDEX_UPSTREAM_BASE_URL` when resolvable, authenticated via API key.
-  2. If no provider is resolvable, fall back to official ChatGPT endpoint (`https://chatgpt.com/backend-api/codex`) and use `tokens.access_token` (then `tokens.id_token`) from `~/.codex/auth.json`.
-- In token mode, `claudex` automatically refreshes expired tokens via `tokens.refresh_token` when possible.
-- In token mode, if `tokens.account_id` exists, `claudex` sends it as `ChatGPT-Account-Id`.
-- To avoid model-availability errors on ChatGPT accounts, `claudex` uses `gpt-5-codex` as the implicit default model in ChatGPT mode (unless you explicitly set `model` or `CLAUDEX_FORCE_MODEL`).
-- `claudex` sets `ANTHROPIC_API_KEY` to the upstream bearer credential and, unless you pass `--settings` yourself, injects `--settings {"forceLoginMethod":"console"}` to avoid Claude.ai-subscription-first login flows.
+```bash
+tar xzf claudex-*-linux-*.tar.gz
+cd claudex-*
+./install.sh
+```
 
-## Quality gates
+### Windows
 
-- Typecheck: `bun run typecheck`
-- Tests: `bun test`
-- Combined check: `bun run check`
-- Enable local git hook: `bun run setup:hooks`
+**Installer (.exe)**
 
-## Automated release
+Download `claudex-*-windows-x64-setup.exe` from [Releases](../../releases) and run it.
 
-GitHub Actions runs on every push to `main` and once per day:
+**ZIP**
 
-1. Fetches the latest `install.sh` from `https://claude.ai/install.sh`.
-2. Extracts `GCS_BUCKET` from that script and reads the latest Claude Code version.
-3. On `push` to `main`, always creates a rolling release tag `claude-vX.Y.Z-build.<run_number>`.
-4. On scheduled/manual runs, creates `claude-vX.Y.Z` only when that upstream version is not released yet.
-5. Builds `claudex` binaries for Linux, macOS, and Windows via Bun `--compile`.
-6. Publishes a GitHub release with those binaries.
+```powershell
+Expand-Archive claudex-*-windows-x64.zip -DestinationPath .
+.\claudex\claudex.exe
+```
+
+Add `claudex.exe` to your PATH for global access.
+
+### Build from source
+
+```bash
+git clone https://github.com/serkenn/claudex-mac.git
+cd claudex-mac
+npm install
+npm run dev
+```
+
+## Usage
+
+```bash
+claudex              # Start interactive session
+claudex login        # Login with ChatGPT account
+claudex logout       # Clear credentials
+claudex reset        # Reset config and re-run setup
+claudex -p "..."     # One-shot prompt
+claudex --model o3   # Use specific model
+```
+
+### In-session commands
+
+| Command        | Description           |
+|----------------|-----------------------|
+| `/clear`       | Clear conversation    |
+| `/model <name>`| Change model          |
+| `/auto`        | Toggle auto-approve   |
+| `/exit`        | Exit                  |
+
+### Supported models
+
+| Model          | Description                    |
+|----------------|--------------------------------|
+| `o4-mini`      | Fast, cost-effective (default) |
+| `gpt-4.1`     | Balanced performance           |
+| `gpt-4.1-mini` | Lightweight                   |
+| `gpt-4.1-nano` | Fastest                       |
+| `o3`           | Most capable reasoning         |
+| `o3-pro`       | Maximum quality                |
+
+## License
+
+MIT
