@@ -103,6 +103,9 @@ describe("responses bridge", () => {
         tool_choice: { type: "any" },
         max_tokens: 1024,
         output_config: { effort: "high" },
+        context_management: {
+          edits: [{ type: "clear_tool_uses_20250919", trigger: "auto" }],
+        },
       },
       {
         forcedModel: "gpt-5.3-codex",
@@ -123,6 +126,7 @@ describe("responses bridge", () => {
     expect(adapted.messages).toBeUndefined();
     expect(adapted.system).toBeUndefined();
     expect(adapted.max_tokens).toBeUndefined();
+    expect(adapted.context_management).toBeUndefined();
     expect(adapted.store).toBe(false);
   });
 

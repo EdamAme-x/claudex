@@ -113,6 +113,7 @@ function adaptAnthropicMessagesRequestForResponses(parsed: JsonObject, options: 
   delete parsed.output_config;
   delete parsed.thinking;
   delete parsed.metadata;
+  delete parsed.context_management;
   parsed.store = false;
   return parsed;
 }
