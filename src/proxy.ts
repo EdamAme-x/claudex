@@ -339,6 +339,13 @@ async function proxyResponsesAsAnthropic(
   let usageInputTokens = 0;
   let usageOutputTokens = 0;
 
+  // Streaming responses leave `response.completed.response.output` empty
+  // and emit each completed output item via `response.output_item.done`
+  // instead. Collect those so function_call items (and any other output
+  // produced via streaming) are not lost when we map back to Anthropic
+  // content blocks.
+  const streamedOutputItems: unknown[] = [];
+
   const decoder = new TextDecoder();
   let buffered = "";
   for await (const chunk of Readable.fromWeb(upstreamResponse.body as any)) {
@@ -349,14 +356,26 @@ async function proxyResponsesAsAnthropic(
       if (parsed?.type === "response.output_text.delta" && typeof parsed.delta === "string") {
         text += parsed.delta;
       }
+      if (parsed?.type === "response.output_item.done" && parsed?.item) {
+        streamedOutputItems.push(parsed.item);
+      }
       if (parsed?.type === "response.completed") {
         usageInputTokens = Number(parsed?.response?.usage?.input_tokens || 0);
         usageOutputTokens = Number(parsed?.response?.usage?.output_tokens || 0);
         if (typeof parsed?.response?.model === "string" && parsed.response.model.trim().length > 0) {
           model = parsed.response.model;
         }
-        if (Array.isArray(parsed?.response?.output)) {
-          const mapped = mapResponsesOutputToAnthropicContent(parsed.response.output);
+        // Prefer items collected via streaming; fall back to the final
+        // `response.output` array for non-streaming or future API shapes
+        // that populate it.
+        const finalOutput =
+          streamedOutputItems.length > 0
+            ? streamedOutputItems
+            : Array.isArray(parsed?.response?.output)
+              ? parsed.response.output
+              : [];
+        if (finalOutput.length > 0) {
+          const mapped = mapResponsesOutputToAnthropicContent(finalOutput);
           parsedContent = mapped.content;
           stopReason = mapped.stopReason;
         }
