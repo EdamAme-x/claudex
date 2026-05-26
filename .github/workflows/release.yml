@@ -31,13 +31,13 @@ jobs:
 
           installer_url="https://claude.ai/install.sh"
           installer_script="$(curl -fsSL "${installer_url}")"
-          bucket="$(printf '%s\n' "${installer_script}" | awk -F'"' '/^GCS_BUCKET=/{print $2; exit}')"
-          if [[ -z "${bucket}" ]]; then
-            echo "Failed to extract GCS_BUCKET from installer script: ${installer_url}"
+          download_base_url="$(printf '%s\n' "${installer_script}" | awk -F'"' '/^DOWNLOAD_BASE_URL=/{print $2; exit}')"
+          if [[ -z "${download_base_url}" ]]; then
+            echo "Failed to extract DOWNLOAD_BASE_URL from installer script: ${installer_url}"
             exit 1
           fi
 
-          latest="$(curl -fsSL "$bucket/latest" | tr -d '\r\n')"
+          latest="$(curl -fsSL "$download_base_url/latest" | tr -d '\r\n')"
           if [[ -z "$latest" ]]; then
             echo "Failed to read latest version"
             exit 1
@@ -74,7 +74,7 @@ jobs:
           echo "latest_version=${latest}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "release_name=${release_name}" >> "$GITHUB_OUTPUT"
-          echo "bucket=${bucket}" >> "$GITHUB_OUTPUT"
+          echo "download_base_url=${download_base_url}" >> "$GITHUB_OUTPUT"
           echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
 
       - name: Setup Bun
@@ -100,7 +100,7 @@ jobs:
           body: |
             Automated release for Claude Code version `${{ steps.detect.outputs.latest_version }}`.
             Bundled with Bun compile targets for Linux, macOS, and Windows.
-            Source bucket: `${{ steps.detect.outputs.bucket }}`.
+            Source: `${{ steps.detect.outputs.download_base_url }}`.
           files: |
             dist/claudex-linux-x64
             dist/claudex-linux-arm64
